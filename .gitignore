@@ -48,3 +48,5 @@ build/
 # Uploaded documents
 backend/uploads/*
 !backend/uploads/.gitkeep
+!backend/uploads/wipo_documents/
+!backend/uploads/wipo_documents/**
