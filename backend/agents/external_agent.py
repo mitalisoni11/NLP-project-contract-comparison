@@ -1,158 +1,190 @@
 """
-Faux External Agent - Simulates external database queries (e.g., WIPO).
+External Agent - Performs real semantic search on Pinecone using embedded WIPO documents.
 """
+
 from uuid import UUID
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import logging
+
 from ..interfaces.agent import AgentInterface
 from ..services.llm_service import LLMService
+from pinecone import Pinecone
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
 
 class ExternalAgent(AgentInterface):
-	"""Faux agent for querying external databases (e.g., WIPO)."""
-	
-	def __init__(self):
-		self._uuid: UUID = None
-		self._ollama: LLMService = None  # Keep variable name for backward compatibility
-		self._system_prompt = """You are an external database agent that queries international legal and compliance databases.
+    """Agent that performs real semantic search over Pinecone index (WIPO documents)."""
 
-Your databases include:
-- WIPO (World Intellectual Property Organization) database
-- Regional compliance databases (African Union, EU regulations, etc.)
-- International legal standards and requirements
-- Cross-border compliance requirements
-- Regional setup and implementation requirements
+    def __init__(self):
+        self._uuid: UUID = None
+        self._llm: Optional[LLMService] = None
+        self._pinecone_client: Optional[Pinecone] = None
+        self._pinecone_index = None
 
-CRITICAL: Keep responses under 300 words. Be concise but informative.
+        # You can configure this
+        self.INDEX_NAME = "wipo-index"
+        self.EMBED_MODEL = "text-embedding-3-small"
 
-When given a query:
-1. Act as if you are querying real external databases (WIPO, regional compliance systems)
-2. Provide information about international regulations, regional requirements, and compliance standards
-3. Reference specific regulations, standards, or database entries when relevant
-4. Focus on requirements for specific regions (e.g., Africa, Asia, Europe)
-5. Provide setup procedures, compliance requirements, and regional variations
-6. Keep responses concise - focus on key requirements only
+        # System prompt instructing the LLM how to behave
+        self._system_prompt = """
+You are an external WIPO document agent.
 
-Example response style (keep it brief):
-"According to WIPO database entry WIPO-REG-2024-AFR-001, the requirements for setting up in Africa include... The African Union compliance standards specify... Key regional variations: ..."
+You MUST:
+- Use ONLY the information retrieved from Pinecone semantic search
+- Cite the filenames and chunk numbers exactly
+- Produce concise factual summaries
+- Avoid hallucinating sections not present in retrieved text
 
-Be authoritative, reference external sources, and provide specific but concise compliance information."""
-	
-	@property
-	def name(self) -> str:
-		return "External Agent"
-	
-	@property
-	def description(self) -> str:
-		return "Faux agent for querying external databases (e.g., WIPO)"
-	
-	@property
-	def agent_id_str(self) -> str:
-		return "external_agent"
-	
-	@property
-	def uuid(self) -> UUID:
-		return self._uuid
-	
-	@uuid.setter
-	def uuid(self, value: UUID):
-		self._uuid = value
-	
-	async def initialize(self, config: Dict[str, Any]) -> None:
-		"""Initialize the agent."""
-		# Accept either llm_service instance or create from config
-		if "llm_service" in config:
-			self._ollama = config["llm_service"]
-		else:
-			# Fallback: create from config (backward compatibility)
-			from ..services.llm_factory import create_llm_service
-			self._ollama = create_llm_service()
-	
-	def _get_llm_service(self, request: Dict[str, Any]) -> LLMService:
-		"""Get LLM service from request override or use default."""
-		if "llm_service" in request:
-			return request["llm_service"]
-		return self._ollama
-	
-	async def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-		"""Process a query request."""
-		command = request.get("command", "query")
-		
-		if command == "query":
-			query = request.get("query", "")
-			if not query:
-				return {
-					"success": False,
-					"error": "Query is required"
-				}
-			
-			logger.info(f"      🟢 EXTERNAL AGENT: Processing query...")
-			logger.info(f"      📋 Full query for external_agent: {query}")
-			print(f"      🟢 EXTERNAL AGENT: Processing query...")
-			print(f"      📋 Full query for external_agent: {query}")
-			try:
-				# Get model override and LLM service from request if provided
-				model_override = request.get("model")
-				llm_service_to_use = self._get_llm_service(request)
-				
-				# Limit agent responses to 400 tokens (approximately 300 words)
-				response = await llm_service_to_use.generate(
-					prompt=query,
-					system=self._system_prompt,
-					max_tokens=400,
-					model=model_override
-				)
-				
-				logger.info(f"      ✅ EXTERNAL AGENT: Got response ({len(response)} chars)")
-				print(f"      ✅ EXTERNAL AGENT: Got response ({len(response)} chars)")
-				return {
-					"success": True,
-					"data": {
-						"query": query,
-						"response": response,
-						"source": "external_database"
-					}
-				}
-			except Exception as e:
-				error_msg = f"      ❌ EXTERNAL AGENT ERROR: {str(e)}"
-				logger.error(error_msg)
-				print(error_msg)
-				return {
-					"success": False,
-					"error": str(e)
-				}
-		else:
-			return {
-				"success": False,
-				"error": f"Unknown command: {command}"
-			}
-	
-	async def shutdown(self) -> None:
-		"""Cleanup resources."""
-		pass
-	
-	def get_tools(self) -> List[Dict[str, Any]]:
-		"""Return available tools."""
-		return [
-			{
-				"name": "query",
-				"description": "Query external databases (e.g., WIPO) for legal and compliance information",
-				"parameters": {
-					"query": {
-						"type": "string",
-						"description": "The query to search external databases"
-					}
-				}
-			}
-		]
-	
-	def get_status(self) -> Dict[str, Any]:
-		"""Return agent status."""
-		return {
-			"status": "active",
-			"type": "external",
-			"ollama_configured": self._ollama is not None
-		}
+Response format:
+1. Short answer (3–6 sentences)
+2. "Sources:" list filenames + chunk_ids
+"""
 
+    # Required interface properties
+    @property
+    def name(self) -> str:
+        return "External Agent"
+
+    @property
+    def description(self) -> str:
+        return "Performs semantic search on WIPO documents using Pinecone."
+
+    @property
+    def agent_id_str(self) -> str:
+        return "external_agent"
+
+    @property
+    def uuid(self) -> UUID:
+        return self._uuid
+
+    @uuid.setter
+    def uuid(self, value: UUID):
+        self._uuid = value
+
+    # ---------------------------- INIT ----------------------------
+    async def initialize(self, config: Dict[str, Any]) -> None:
+        """Initialize LLM and Pinecone from config."""
+        # Accept injected LLMService
+        if "llm_service" in config:
+            self._llm = config["llm_service"]
+
+        # Pinecone init
+        if "pinecone_api_key" in config:
+            self._pinecone_client = Pinecone(api_key=config["pinecone_api_key"])
+            self._pinecone_index = self._pinecone_client.Index(self.INDEX_NAME)
+
+        else:
+            raise ValueError("pinecone_api_key is required for ExternalAgent")
+
+        logger.info("ExternalAgent initialized successfully.")
+
+    # ---------------------------- SEARCH ----------------------------
+    def _embed_query(self, query: str) -> List[float]:
+        """Generate embedding for the semantic search query."""
+        client = OpenAI()
+
+        resp = client.embeddings.create(
+            model=self.EMBED_MODEL,
+            input=query
+        )
+
+        return resp.data[0].embedding
+
+    def _semantic_search(self, query_embed: List[float], top_k=5):
+        """Run a Pinecone similarity search."""
+        result = self._pinecone_index.query(
+            vector=query_embed,
+            top_k=top_k,
+            include_metadata=True
+        )
+        return result.matches or []
+
+    # ---------------------------- MAIN HANDLER ----------------------------
+    async def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle semantic search requests."""
+        command = request.get("command")
+
+        if command != "query":
+            return {"success": False, "error": f"Unknown command: {command}"}
+
+        query = request.get("query", "")
+        if not query:
+            return {"success": False, "error": "Query is required"}
+
+        logger.info("🔵 ExternalAgent: Embedding query...")
+        query_embed = self._embed_query(query)
+
+        logger.info("🔍 ExternalAgent: Running semantic search...")
+        matches = self._semantic_search(query_embed=query_embed, top_k=5)
+
+        if not matches:
+            return {
+                "success": True,
+                "data": {
+                    "query": query,
+                    "response": "No relevant WIPO documents found.",
+                    "source": []
+                }
+            }
+
+        # Aggregate retrieved text
+        combined_context = "\n\n".join(
+            f"[{m.metadata['file_name']} - chunk {m.metadata['chunk_id']}]\n{m.metadata['text']}"
+            for m in matches
+        )
+
+        # LLM final answer
+        logger.info("🧠 ExternalAgent: Calling LLM for summary...")
+        llm_response = await self._llm.generate(
+            system=self._system_prompt,
+            prompt=f"""
+User query: {query}
+
+Retrieved context:
+{combined_context}
+""",
+            max_tokens=300,
+        )
+
+        return {
+            "success": True,
+            "data": {
+                "query": query,
+                "response": llm_response,
+                "source": [
+                    {
+                        "file_name": m.metadata["file_name"],
+                        "chunk_id": m.metadata["chunk_id"],
+                        "score": m.score,
+                    }
+                    for m in matches
+                ]
+            }
+        }
+
+    # ---------------------------- STATUS & TOOLS ----------------------------
+    def get_tools(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "query",
+                "description": "Query Pinecone-indexed WIPO documents",
+                "parameters": {
+                    "query": {
+                        "type": "string",
+                        "description": "User query for semantic search"
+                    }
+                }
+            }
+        ]
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "status": "active",
+            "pinecone_connected": self._pinecone_index is not None,
+            "llm_connected": self._llm is not None
+        }
+
+    async def shutdown(self) -> None:
+        pass
