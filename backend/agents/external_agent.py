@@ -2,6 +2,7 @@
 External Agent - Performs real semantic search on Pinecone using embedded WIPO documents.
 """
 
+import os
 from uuid import UUID
 from typing import Dict, Any, List, Optional
 import logging
@@ -22,8 +23,9 @@ class ExternalAgent(AgentInterface):
         self._llm: Optional[LLMService] = None
         self._pinecone_client: Optional[Pinecone] = None
         self._pinecone_index = None
+        self._openai_client: Optional[OpenAI] = None
 
-        # You can configure this
+        # Configurable settings
         self.INDEX_NAME = "wipo-index"
         self.EMBED_MODEL = "text-embedding-3-small"
 
@@ -69,23 +71,41 @@ Response format:
         # Accept injected LLMService
         if "llm_service" in config:
             self._llm = config["llm_service"]
-
-        # Pinecone init
-        if "pinecone_api_key" in config:
-            self._pinecone_client = Pinecone(api_key=config["pinecone_api_key"])
-            self._pinecone_index = self._pinecone_client.Index(self.INDEX_NAME)
-
         else:
-            raise ValueError("pinecone_api_key is required for ExternalAgent")
+            # Fallback: create from config (backward compatibility)
+            from ..services.llm_factory import create_llm_service
+            self._llm = create_llm_service()
+        
+        # Override configurable settings if provided
+        if "index_name" in config:
+            self.INDEX_NAME = config["index_name"]
+        if "embed_model" in config:
+            self.EMBED_MODEL = config["embed_model"]
+
+        # Pinecone init from environment variable or config
+        pinecone_api_key = config.get("pinecone_api_key") or os.getenv("PINECONE_API_KEY")
+        if not pinecone_api_key:
+            raise ValueError("pinecone_api_key is required for ExternalAgent (set PINECONE_API_KEY env var or pass in config)")
+        
+        self._pinecone_client = Pinecone(api_key=pinecone_api_key)
+        self._pinecone_index = self._pinecone_client.Index(self.INDEX_NAME)
+        
+        # Initialize OpenAI client from environment variable or config
+        openai_api_key = config.get("openai_api_key") or os.getenv("OPENAI_API_KEY")
+        if not openai_api_key:
+            raise ValueError("openai_api_key is required for ExternalAgent (set OPENAI_API_KEY env var or pass in config)")
+        
+        self._openai_client = OpenAI(api_key=openai_api_key)
 
         logger.info("ExternalAgent initialized successfully.")
 
     # ---------------------------- SEARCH ----------------------------
     def _embed_query(self, query: str) -> List[float]:
         """Generate embedding for the semantic search query."""
-        client = OpenAI()
-
-        resp = client.embeddings.create(
+        if not self._openai_client:
+            raise RuntimeError("OpenAI client not initialized. Call initialize() first.")
+        
+        resp = self._openai_client.embeddings.create(
             model=self.EMBED_MODEL,
             input=query
         )
@@ -102,6 +122,12 @@ Response format:
         return result.matches or []
 
     # ---------------------------- MAIN HANDLER ----------------------------
+    def _get_llm_service(self, request: Dict[str, Any]) -> LLMService:
+        """Get LLM service from request override or use default."""
+        if "llm_service" in request:
+            return request["llm_service"]
+        return self._llm
+
     async def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Handle semantic search requests."""
         command = request.get("command")
@@ -112,6 +138,16 @@ Response format:
         query = request.get("query", "")
         if not query:
             return {"success": False, "error": "Query is required"}
+        
+        # Get model override and LLM service from request if provided
+        model_override = request.get("model")
+        llm_service_to_use = self._get_llm_service(request)
+        
+        # Handle selected_documents parameter (for consistency with InternalAgent)
+        selected_documents = request.get("selected_documents", [])
+        if selected_documents:
+            logger.info(f"      📄 Selected documents passed to ExternalAgent: {selected_documents}")
+            logger.info(f"      ℹ️  Note: ExternalAgent queries Pinecone, not document files")
 
         logger.info("🔵 ExternalAgent: Embedding query...")
         query_embed = self._embed_query(query)
@@ -137,7 +173,7 @@ Response format:
 
         # LLM final answer
         logger.info("🧠 ExternalAgent: Calling LLM for summary...")
-        llm_response = await self._llm.generate(
+        llm_response = await llm_service_to_use.generate(
             system=self._system_prompt,
             prompt=f"""
 User query: {query}
@@ -146,6 +182,7 @@ Retrieved context:
 {combined_context}
 """,
             max_tokens=300,
+            model=model_override
         )
 
         return {
