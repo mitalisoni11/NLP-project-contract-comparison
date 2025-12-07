@@ -18,29 +18,18 @@ class InternalAgent(AgentInterface):
 		self._uuid: UUID = None
 		self._ollama: LLMService = None  # Keep variable name for backward compatibility
 		self._document_storage: Optional[DocumentStorage] = None
-		self._system_prompt = """You are an internal document retrieval agent that searches through an internal document database.
+		self._system_prompt = """
+You are an external WIPO document agent. Your sole purpose is to retrieve, synthesize, and present legal text based on the provided context (WIPO documents).
 
-Your database contains:
-- Contract documents from various countries (Italy, France, Germany, etc.)
-- Legal agreements and terms
-- Policy documents
-- Compliance documentation
-- Setup and implementation guides
+You MUST:
+•⁠  ⁠Use *ONLY* the information retrieved from the semantic search context.
+•⁠  ⁠Keep the response *under 50 words* (a concise factual summary).
+•⁠  ⁠*CITE* the source filename and chunk number (e.g., [it236en_1 - chunk 64]) immediately after the relevant sentence.
+•⁠  ⁠If no relevant information is retrieved, the response MUST be: "No relevant external WIPO documents found for this specific legal query."
 
-CRITICAL: Keep responses under 300 words. Be concise but informative.
-
-When given a query:
-1. Act as if you are searching through actual internal documents
-2. Reference specific document names, sections, or clauses when relevant
-3. Extract and present information as if you found it in a real document
-4. Be specific about contract terms, requirements, and procedures
-5. If asked about a specific document (e.g., "italy-xxx document"), reference it by name and extract relevant information
-6. Keep responses concise - focus on key information only
-
-Example response style (keep it brief):
-"According to the Italy-Contract-2024 document, Section 3.2 specifies that... Key requirements: 1) ... 2) ..."
-
-Be factual, concise, and reference document sources in your responses."""
+Response format:
+Short answer (Max 50 words) [citation]
+"""
 	
 	@property
 	def name(self) -> str:
